@@ -1,0 +1,106 @@
+name: RDP-Debian (xrdp + Tailscale Auto-Reconnect)
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp-debian:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    env:
+      USERNAME: rdpuser
+
+    steps:
+      - name: ⚙️ Setup and install base packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            lxde lxde-core xorg dbus-x11 x11-xserver-utils xrdp curl wget
+
+      - name: 👤 Create user and set strong password
+        id: create_user
+        run: |
+          PASSWORD=$(openssl rand -base64 24)
+          sudo useradd -m -s /bin/bash ${USERNAME}
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo ${USERNAME}
+          echo "RDP_CREDS=User: ${USERNAME} | Password: ${PASSWORD}" >> $GITHUB_ENV
+          id ${USERNAME}
+
+      - name: 🖥️ Configure xrdp with LXDE
+        run: |
+          echo "startlxde" | sudo tee /home/${USERNAME}/.xsession
+          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession
+          sudo systemctl enable --now xrdp
+
+      - name: 🌐 Install and start Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo systemctl enable --now tailscaled
+
+      - name: 🔑 Bring up Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if [ -z "${TAILSCALE_AUTH_KEY:-}" ]; then
+            echo "❌ Missing TAILSCALE_AUTH_KEY"; exit 1
+          fi
+          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname=gh-runner-${GITHUB_RUN_ID} --ssh
+          
+          for i in {1..10}; do
+            TS_IP=$(tailscale ip -4 2>/dev/null || true)
+            [ -n "${TS_IP:-}" ] && break || sleep 5
+          done
+          if [ -z "${TS_IP:-}" ]; then
+            echo "❌ No Tailscale IP assigned."; exit 1
+          fi
+          echo "TAILSCALE_IP=${TS_IP}" >> $GITHUB_ENV
+          echo "✅ Connected with IP ${TS_IP}"
+
+      - name: 🧪 Verify Tailscale connectivity
+        run: |
+          sudo tailscale status
+          sudo tailscale netcheck
+          curl -I https://google.com --max-time 10 || echo "⚠️ Internet unreachable"
+          echo "✅ Connectivity verified."
+
+      - name: 🔓 Open firewall for RDP
+        run: |
+          if command -v ufw >/dev/null 2>&1; then
+            sudo ufw allow 3389/tcp || true
+          else
+            sudo iptables -I INPUT -p tcp --dport 3389 -j ACCEPT || true
+          fi
+
+      - name: 📜 Show RDP access info
+        run: |
+          echo "=== RDP ACCESS INFO ==="
+          echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
+          echo "Username: ${{ env.USERNAME }}"
+          echo "Password: ${RDP_CREDS##*Password: }"
+          echo "======================="
+          sudo ss -ltnp | grep -E ':3389\b' || true
+
+      - name: 🛡️ Keep alive + auto-reconnect Tailscale
+        run: |
+          echo "🔁 Starting Tailscale watchdog..."
+          while true; do
+            date
+            STATUS=$(sudo tailscale status 2>/dev/null || true)
+            if ! echo "$STATUS" | grep -q "${{ env.TAILSCALE_IP }}"; then
+              echo "⚠️ Tailscale appears disconnected. Attempting reconnection..."
+              sudo tailscale up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname=gh-runner-${GITHUB_RUN_ID} --ssh || true
+              sleep 10
+              NEW_IP=$(tailscale ip -4 2>/dev/null || true)
+              if [ -n "$NEW_IP" ]; then
+                echo "✅ Reconnected successfully with IP: $NEW_IP"
+                echo "TAILSCALE_IP=${NEW_IP}" >> $GITHUB_ENV
+              else
+                echo "❌ Reconnection failed. Will retry in 1 minute."
+              fi
+            else
+              echo "✅ Tailscale active and healthy."
+            fi
+            sleep 60
+          done
